@@ -61,6 +61,7 @@ var (
 	selfPackage     = flag.String("self_package", "", "The full package import path for the generated code. The purpose of this flag is to prevent import cycles in the generated code by trying to include its own package. This can happen if the mock's package is set to one of its inputs (usually the main one) and the output is stdio so mockgen cannot detect the final output package. Setting this flag will then tell mockgen which import to exclude.")
 	writePkgComment = flag.Bool("write_package_comment", true, "Writes package documentation comment (godoc) if true.")
 	copyrightFile   = flag.String("copyright_file", "", "Copyright file used to add copyright header")
+	stackable       = flag.Bool("stackable", false, "")
 
 	debugParser = flag.Bool("debug_parser", false, "Print out parser results only.")
 	showVersion = flag.Bool("version", false, "Print version.")
@@ -156,6 +157,10 @@ func main() {
 
 		g.copyrightHeader = string(header)
 	}
+	g.stackable = *stackable
+	if *stackable && *source == "" {
+		log.Fatalf("Stackable mocks can only be created in source mode")
+	}
 	if err := g.Generate(pkg, outputPackageName, outputPackagePath); err != nil {
 		log.Fatalf("Failed generating mock: %v", err)
 	}
@@ -226,6 +231,7 @@ type generator struct {
 	destination               string            // may be empty
 	srcPackage, srcInterfaces string            // may be empty
 	copyrightHeader           string
+	stackable                 bool
 
 	packageMap map[string]string // map from import path to package name
 }
@@ -309,6 +315,11 @@ func (g *generator) Generate(pkg *model.Package, outputPkgName string, outputPac
 		sortedPaths[x] = pth
 		x++
 	}
+	// if stackable, import source package
+	if g.stackable {
+		sortedPaths = append(sortedPaths, pkg.PkgPath)
+	}
+
 	sort.Strings(sortedPaths)
 
 	packagesName := createPackageMap(sortedPaths)
@@ -362,7 +373,7 @@ func (g *generator) Generate(pkg *model.Package, outputPkgName string, outputPac
 	g.p(")")
 
 	for _, intf := range pkg.Interfaces {
-		if err := g.GenerateMockInterface(intf, outputPackagePath); err != nil {
+		if err := g.GenerateMockInterface(pkg, intf, outputPackagePath); err != nil {
 			return err
 		}
 	}
@@ -404,7 +415,7 @@ func (g *generator) formattedTypeParams(it *model.Interface, pkgOverride string)
 	return long.String(), short.String()
 }
 
-func (g *generator) GenerateMockInterface(intf *model.Interface, outputPackagePath string) error {
+func (g *generator) GenerateMockInterface(pkg *model.Package, intf *model.Interface, outputPackagePath string) error {
 	mockType := g.mockName(intf.Name)
 	longTp, shortTp := g.formattedTypeParams(intf, outputPackagePath)
 
@@ -412,6 +423,9 @@ func (g *generator) GenerateMockInterface(intf *model.Interface, outputPackagePa
 	g.p("// %v is a mock of %v interface.", mockType, intf.Name)
 	g.p("type %v%v struct {", mockType, longTp)
 	g.in()
+	if g.stackable {
+		g.p("frame    gomock.StackFrame")
+	}
 	g.p("ctrl     *gomock.Controller")
 	g.p("recorder *%vMockRecorder%v", mockType, shortTp)
 	g.out()
@@ -426,15 +440,64 @@ func (g *generator) GenerateMockInterface(intf *model.Interface, outputPackagePa
 	g.p("}")
 	g.p("")
 
+	if g.stackable {
+		g.p("// %v%vOption is a function that customizes the mock.", mockType, longTp)
+		g.p("type %v%vOption func(m *%v%v)", mockType, longTp, mockType, shortTp)
+		g.p("")
+	}
+
 	g.p("// New%v creates a new mock instance.", mockType)
-	g.p("func New%v%v(ctrl *gomock.Controller) *%v%v {", mockType, longTp, mockType, shortTp)
+	if g.stackable {
+		g.p("func New%v%v(ctrl *gomock.Controller, opt ...%v%vOption) *%v%v {", mockType, longTp, mockType, longTp, mockType, shortTp)
+	} else {
+		g.p("func New%v%v(ctrl *gomock.Controller) *%v%v {", mockType, longTp, mockType, shortTp)
+	}
 	g.in()
 	g.p("mock := &%v%v{ctrl: ctrl}", mockType, shortTp)
 	g.p("mock.recorder = &%vMockRecorder%v{mock}", mockType, shortTp)
+	if g.stackable {
+		g.p("for _, o := range opt {")
+		g.in()
+		g.p("o(mock)")
+		g.out()
+		g.p("}")
+	}
 	g.p("return mock")
 	g.out()
 	g.p("}")
 	g.p("")
+
+	if g.stackable {
+		var intfType string
+		if base, ok := g.packageMap[pkg.PkgPath]; ok && base != "." {
+			intfType = fmt.Sprintf("%v.%v", base, intf.Name)
+		} else {
+			intfType = intf.Name
+		}
+		g.p("// WithBacking%v returns an Option that adds the given backing implementation to the mock.", intf.Name)
+		g.p("func WithBacking%v(next %v) %vOption {", intf.Name, intfType, mockType)
+		g.in()
+		g.p("return func(m *%v) {", mockType)
+		g.in()
+		g.p("m.frame = gomock.StackFrame{Next: next, Level: 0}")
+		g.p("for level := 1; ; level++ {")
+		g.in()
+		g.p("b, ok := m.frame.Next.(*%v)", mockType)
+		g.p("if !ok {")
+		g.in()
+		g.p("break")
+		g.out()
+		g.p("}")
+		g.p("b.frame.Level = level")
+		g.p("m = b")
+		g.out()
+		g.p("}")
+		g.out()
+		g.p("}")
+		g.out()
+		g.p("}")
+		g.p("")
+	}
 
 	// XXX: possible name collision here if someone has EXPECT in their interface.
 	g.p("// EXPECT returns an object that allows the caller to indicate expected use.")
@@ -524,10 +587,18 @@ func (g *generator) GenerateMockMethod(mockType string, m *model.Method, pkgOver
 		callArgs = ", " + idVarArgs + "..."
 	}
 	if len(m.Out) == 0 {
-		g.p(`%v.ctrl.Call(%v, %q%v)`, idRecv, idRecv, m.Name, callArgs)
+		if g.stackable {
+			g.p(`%v.ctrl.CallStacked(%v, &%v.frame, %q%v)`, idRecv, idRecv, idRecv, m.Name, callArgs)
+		} else {
+			g.p(`%v.ctrl.Call(%v, %q%v)`, idRecv, idRecv, m.Name, callArgs)
+		}
 	} else {
 		idRet := ia.allocateIdentifier("ret")
-		g.p(`%v := %v.ctrl.Call(%v, %q%v)`, idRet, idRecv, idRecv, m.Name, callArgs)
+		if g.stackable {
+			g.p(`%v := %v.ctrl.CallStacked(%v, &%v.frame, %q%v)`, idRet, idRecv, idRecv, idRecv, m.Name, callArgs)
+		} else {
+			g.p(`%v := %v.ctrl.Call(%v, %q%v)`, idRet, idRecv, idRecv, m.Name, callArgs)
+		}
 
 		// Go does not allow "naked" type assertions on nil values, so we use the two-value form here.
 		// The value of that is either (x.(T), true) or (Z, false), where Z is the zero value for T.

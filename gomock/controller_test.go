@@ -952,3 +952,54 @@ func TestCallAfterLoopPanic(t *testing.T) {
 	})
 	ctrl = gomock.NewController(reporter)
 }
+
+func TestSingleCall(t *testing.T) {
+	reporter, ctrl := createFixtures(t)
+	_ = reporter
+	subject := new(Subject)
+
+	reporter.assertFatal(func() {
+		ctrl.Call(subject, "FooMethod", "argument")
+	}, "/controller_test.go:") // error message must have this filename in it (ErrorReporter.assertFatal above)
+
+	ctrl.Finish()
+}
+
+type MockSubject struct {
+	ctrl  *gomock.Controller
+	frame gomock.StackFrame
+}
+
+func (s *MockSubject) FooMethod(arg string) int {
+	ret := s.ctrl.CallStacked(s, &s.frame, "FooMethod")
+	ret0, _ := ret[0].(int)
+	return ret0
+}
+
+func (s *MockSubject) BarMethod(arg string) int {
+	ret := s.ctrl.CallStacked(s, &s.frame, "BarMethod")
+	ret0, _ := ret[0].(int)
+	return ret0
+}
+
+func TestStackedCall(t *testing.T) {
+	reporter, ctrl := createFixtures(t)
+	_ = reporter
+	subject := &MockSubject{
+		ctrl: ctrl,
+		frame: gomock.StackFrame{
+			Next: &MockSubject{
+				ctrl: ctrl,
+				frame: gomock.StackFrame{
+					Level: 1,
+				},
+			},
+		},
+	}
+
+	reporter.assertFatal(func() {
+		ctrl.CallStacked(subject, &subject.frame, "FooMethod", "argument")
+	}, "/controller_test.go:") // error message must have this filename in it (ErrorReporter.assertFatal above)
+
+	ctrl.Finish()
+}
