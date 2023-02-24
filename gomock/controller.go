@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"sync"
 )
 
@@ -176,6 +177,15 @@ func (ctrl *Controller) RecordCallWithMethodType(receiver interface{}, method st
 
 // Call is called by a mock. It should not be called by user code.
 func (ctrl *Controller) Call(receiver interface{}, method string, args ...interface{}) []interface{} {
+	return ctrl.callInternal(receiver, nil, method, args...)
+}
+
+// CallStacked is called by a mock. It should not be called by user code.
+func (ctrl *Controller) CallStacked(receiver interface{}, frame *StackFrame, method string, args ...interface{}) []interface{} {
+	return ctrl.callInternal(receiver, frame, method, args...)
+}
+
+func (ctrl *Controller) callInternal(receiver interface{}, frame *StackFrame, method string, args ...interface{}) []interface{} {
 	ctrl.T.Helper()
 
 	// Nest this code so we can use defer to make sure the lock is released.
@@ -185,11 +195,38 @@ func (ctrl *Controller) Call(receiver interface{}, method string, args ...interf
 		defer ctrl.mu.Unlock()
 
 		expected, err := ctrl.expectedCalls.FindMatch(receiver, method, args)
-		if err != nil {
+		if err != nil && frame != nil && frame.Next != nil {
+			return []func([]interface{}) []interface{}{
+				func(in []interface{}) []interface{} {
+					v := reflect.ValueOf(frame.Next).MethodByName(method)
+					vargs := make([]reflect.Value, len(in))
+					for i := range in {
+						vargs[i] = reflect.ValueOf(in[i])
+					}
+					vrets := v.Call(vargs)
+					out := make([]interface{}, len(vrets))
+					for i := range vrets {
+						out[i] = vrets[i].Interface()
+					}
+					return out
+				},
+			}
+		} else if err != nil {
 			// callerInfo's skip should be updated if the number of calls between the user's test
 			// and this line changes, i.e. this code is wrapped in another anonymous function.
-			// 0 is us, 1 is controller.Call(), 2 is the generated mock, and 3 is the user's test.
-			origin := callerInfo(3)
+			// 0 is us, 1 is controller.callInternal(), 2 is controller.Call/CallStacked(),
+			// 3 is the generated mock, and 4 is the user's test.
+			skip := 4
+			if frame != nil {
+				// Each recursive call (function literal above) adds 5 frames per level
+				// that need to be skipped to get to the caller
+				// 0 is us, 1 is controller.callInernal(), 2 is controller.CallStacked()
+				// 3 is mocked method, 4 is reflect.Value.call(), 5 is reflect.Value.Call()
+				// 6 is the function literal (action) above for nested calls.
+				debug.PrintStack()
+				skip += 6 * frame.Level
+			}
+			origin := callerInfo(skip)
 			ctrl.T.Fatalf("Unexpected call to %T.%v(%v) at %s because: %s", receiver, method, args, origin, err)
 		}
 
@@ -295,4 +332,10 @@ func unwrapTestReporter(t TestReporter) TestReporter {
 		// not wrapped
 	}
 	return tr
+}
+
+// StackFrame holds information about each frame/layer of stacked mocks/implementations.
+type StackFrame struct {
+	Next  interface{}
+	Level int
 }
